@@ -1,5 +1,4 @@
 # -*- coding: utf-8 -*-
-import warnings
 import numpy as np
 import scipy.linalg as la
 from functools import lru_cache
@@ -13,7 +12,6 @@ from ..models.base import LinearModel
 from ..models.measurement.linear import LinearGaussian
 from ..models.measurement import MeasurementModel
 from ..functions import gauss2sigma, unscented_transform
-from ..measures import Measure, Euclidean
 
 
 class KalmanUpdater(Updater):
@@ -60,16 +58,18 @@ class KalmanUpdater(Updater):
 
     # TODO: at present this will throw an error if a measurement model is not
     # TODO: specified in either individual measurements or the Updater object
-    measurement_model: LinearGaussian = Property(
-        default=None,
+    measurement_model = Property(
+        LinearGaussian, default=None,
         doc="A linear Gaussian measurement model. This need not be defined if "
             "a measurement model is provided in the measurement. If no model "
             "specified on construction, or in the measurement, then error "
             "will be thrown.")
-    force_symmetric_covariance: bool = Property(
-        default=False,
-        doc="A flag to force the output covariance matrix to be symmetric by way of a simple "
-            "geometric combination of the matrix and transpose. Default is False.")
+
+    force_symmetric_covariance = Property(
+        bool, default=False, doc="A flag to force the output covariance matrix"
+                                 "to be symmetric by way of a simple geometric"
+                                 "combination of the matrix and transpose."
+                                 "Default is False.")
 
     # This attribute tells the :meth:`update()` method what class to return
     _update_class = GaussianStateUpdate
@@ -170,7 +170,7 @@ class KalmanUpdater(Updater):
         ----------
         hypothesis: :class:`~.Hypothesis`
             A hypothesised association between state prediction and measurement. It returns the
-            measurement prediction which in turn contains the measurement cross covariance,
+            measurement prediction which in turn contains tbe measurement cross covariance,
             :math:`P_{k|k-1} H_k^T and the innovation covariance,
             :math:`S = H_k P_{k|k-1} H_k^T + R`
 
@@ -216,8 +216,10 @@ class KalmanUpdater(Updater):
         # native to the updater
         measurement_model = self._check_measurement_model(measurement_model)
 
+        # Get the predicted measurement
         pred_meas = measurement_model.function(predicted_state, **kwargs)
 
+        # The measurement model matrix
         hh = self._measurement_matrix(predicted_state=predicted_state,
                                       measurement_model=measurement_model,
                                       **kwargs)
@@ -225,6 +227,50 @@ class KalmanUpdater(Updater):
         # The measurement cross covariance and innovation covariance
         meas_cross_cov = self._measurement_cross_covariance(predicted_state, hh)
         innov_cov = self._innovation_covariance(meas_cross_cov, hh, measurement_model)
+
+        return GaussianMeasurementPrediction(pred_meas, innov_cov,
+                                             predicted_state.timestamp,
+                                             cross_covar=meas_cross_cov)
+
+    @lru_cache()
+    def soft_predict_measurement(self, predicted_state, GM_measurement, measurement_model=None,
+                                 **kwargs):
+        r"""Predict the measurement implied by the predicted state mean
+
+        Parameters
+        ----------
+        predicted_state : :class:`~.State`
+            The predicted state :math:`\mathbf{x}_{k|k-1}`
+        GM_measurement : GM component of soft measurements
+        measurement_model : :class:`~.MeasurementModel`
+            The measurement model. If omitted, the model in the updater object
+            is used
+        **kwargs : various
+            These are passed to :meth:`~.MeasurementModel.function` and
+            :meth:`~.MeasurementModel.matrix`
+
+        Returns
+        -------
+        : :class:`GaussianMeasurementPrediction`
+            The measurement prediction, :math:`\mathbf{z}_{k|k-1}`
+
+        """
+        # If a measurement model is not specified then use the one that's
+        # native to the updater
+        measurement_model = self._check_measurement_model(measurement_model)
+
+        # Get the predicted measurement
+        pred_meas = measurement_model.function(predicted_state, **kwargs)
+
+        # The measurement model matrix
+        hh = self._measurement_matrix(predicted_state=predicted_state,
+                                      measurement_model=measurement_model,
+                                      **kwargs)
+
+        # The measurement cross covariance and innovation covariance
+        meas_cross_cov = predicted_state.covar @ hh.T
+        measurement_covariance = GM_measurement.covar
+        innov_cov = hh@predicted_state.covar@hh.T + measurement_covariance
 
         return GaussianMeasurementPrediction(pred_meas, innov_cov,
                                              predicted_state.timestamp,
@@ -268,13 +314,16 @@ class KalmanUpdater(Updater):
             hypothesis.measurement_prediction = self.predict_measurement(
                 predicted_state, measurement_model=measurement_model, **kwargs)
 
+        # Get the predicted measurement mean
+        pred_meas = hypothesis.measurement_prediction.state_vector
+
         # Kalman gain and posterior covariance
         posterior_covariance, kalman_gain = self._posterior_covariance(hypothesis)
 
         # Posterior mean
-        posterior_mean = predicted_state.state_vector + \
-            kalman_gain@(hypothesis.measurement.state_vector -
-                         hypothesis.measurement_prediction.state_vector)
+        posterior_mean = \
+            predicted_state.state_vector \
+            + kalman_gain@(hypothesis.measurement.state_vector - pred_meas)
 
         if self.force_symmetric_covariance:
             posterior_covariance = \
@@ -282,6 +331,78 @@ class KalmanUpdater(Updater):
 
         return self._update_class(posterior_mean, posterior_covariance, hypothesis,
                                   timestamp=hypothesis.measurement.timestamp)
+
+    def soft_update(self, hypothesis, force_symmetric_covariance=False, **kwargs):
+        r"""The Kalman update method. Given a hypothesised association between
+        a predicted state or predicted measurement and an actual measurement,
+        calculate the posterior state.
+
+        Parameters
+        ----------
+        hypothesis : :class:`~.SingleHypothesis`
+            the prediction-measurement association hypothesis. This hypothesis
+            may carry a predicted measurement, or a predicted state. In the
+            latter case a predicted measurement will be calculated.
+        soft_measurement_prediction :
+        force_symmetric_covariance : :obj:`bool`, optional
+            A flag to force the output covariance matrix to be symmetric by way
+            of a simple geometric combination of the matrix and transpose.
+            Default is `False`
+        **kwargs : various
+            These are passed to :meth:`predict_measurement`
+
+        Returns
+        -------
+        : :class:`~.GaussianStateUpdate`
+            The posterior state Gaussian with mean :math:`\mathbf{x}_{k|k}` and
+            covariance :math:`P_{x|x}`
+
+        """
+        # Get the predicted state out of the hypothesis
+        predicted_state = hypothesis.prediction
+
+        # If there is no measurement prediction in the hypothesis then do the
+        # measurement prediction (and attach it back to the hypothesis).
+        if hypothesis.measurement_prediction is None:
+            # Get the measurement model out of the measurement if it's there.
+            # If not, use the one native to the updater (which might still be
+            # none)
+            measurement_model = hypothesis.measurement.measurement_model
+            measurement_model = self._check_measurement_model(
+                measurement_model)
+
+            # Attach the measurement prediction to the hypothesis
+            hypothesis.measurement_prediction = self.soft_predict_measurement(
+                    predicted_state,
+                    hypothesis.measurement.components[0],
+                    hypothesis.measurement.measurement_model)
+
+        # Get the predicted measurement mean, innovation covariance, and
+        # measurement cross-covariance
+        pred_meas = hypothesis.measurement_prediction.state_vector
+        m_cross_cov = hypothesis.measurement_prediction.cross_covar
+        innov_cov = hypothesis.measurement_prediction.covar
+
+        # Kalman gain
+        kalman_gain = m_cross_cov @ np.linalg.inv(innov_cov)
+
+        # Posterior covariance
+        posterior_covariance = \
+            predicted_state.covar - kalman_gain@innov_cov@kalman_gain.T
+
+        # Posterior mean
+        posterior_mean = \
+            predicted_state.state_vector \
+            + kalman_gain@(hypothesis.measurement.components[0].state_vector - pred_meas)
+
+        if force_symmetric_covariance:
+            posterior_covariance = \
+                (posterior_covariance + posterior_covariance.T)/2
+
+        return GaussianStateUpdate(posterior_mean,
+                                   posterior_covariance,
+                                   hypothesis,
+                                   hypothesis.measurement.timestamp)
 
 
 class ExtendedKalmanUpdater(KalmanUpdater):
@@ -295,8 +416,8 @@ class ExtendedKalmanUpdater(KalmanUpdater):
     """
     # TODO: Enforce the fact that this version of MeasurementModel must be
     # TODO: capable of executing :attr:`jacobian()`
-    measurement_model: MeasurementModel = Property(
-        default=None,
+    measurement_model = Property(
+        MeasurementModel, default=None,
         doc="A measurement model. This need not be defined if a measurement "
             "model is provided in the measurement. If no model specified on "
             "construction, or in the measurement, then error will be thrown. "
@@ -344,21 +465,25 @@ class UnscentedKalmanUpdater(KalmanUpdater):
 
     """
     # Can be non-linear and non-differentiable
-    measurement_model: MeasurementModel = Property(
+    measurement_model = Property(
+        MeasurementModel,
         default=None,
         doc="The measurement model to be used. This need not be defined if a "
             "measurement model is provided in the measurement. If no model "
             "specified on construction, or in the measurement, then error "
             "will be thrown.")
-    alpha: float = Property(
+    alpha = Property(
+        float,
         default=0.5,
         doc="Primary sigma point spread scaling parameter. Default is 0.5.")
-    beta: float = Property(
+    beta = Property(
+        float,
         default=2,
         doc="Used to incorporate prior knowledge of the distribution. If the "
             "true distribution is Gaussian, the value of 2 is optimal. "
             "Default is 2")
-    kappa: float = Property(
+    kappa = Property(
+        float,
         default=0,
         doc="Secondary spread scaling parameter. Default is calculated as "
             "3-Ns")
@@ -386,7 +511,6 @@ class UnscentedKalmanUpdater(KalmanUpdater):
             The measurement prediction
 
         """
-
         measurement_model = self._check_measurement_model(measurement_model)
 
         sigma_points, mean_weights, covar_weights = \
@@ -424,10 +548,9 @@ class SqrtKalmanUpdater(KalmanUpdater):
        Journal, 6:6, 1165-1166
 
     """
-    qr_method: bool = Property(
-        default=False,
-        doc="A switch to do the update via a QR decomposition, rather than using the (vector form "
-            "of) the Potter method.")
+    qr_method = Property(bool, default=False, doc="A switch to do the update via a QR"
+                                                  "decomposition, rather than using the (vector"
+                                                  "form of) the Potter method.")
 
     # In this instance the square root form is returned by the :meth:`update()`
     _update_class = SqrtGaussianStateUpdate
@@ -554,107 +677,3 @@ class SqrtKalmanUpdater(KalmanUpdater):
                  hypothesis.measurement_prediction.cross_covar.T)
 
         return post_cov, kalman_gain
-
-
-class IteratedKalmanUpdater(ExtendedKalmanUpdater):
-    r"""This version of the Kalman updater runs an iteration over the linearisation of the
-    sensor function in order to refine the posterior state estimate. Specifically,
-
-    .. math::
-
-        x_{k,i+1} &= x_{k|k-1} + K_i [z - h(x_{k,i}) - H_i (x_{k|k-1} - x_{k,i}) ]
-
-        P_{k,i+1} &= (I - K_i H_i) P_{k|k-1}
-
-    where,
-
-    .. math::
-
-        H_i &= h^{\prime}(x_{k,i}),
-
-        K_i &= P_{k|k-1} H_i^T (H_i P_{k|k-1} H_i^T + R)^{-1}
-
-    and
-
-    .. math::
-
-        x_{k,0} &= x_{k|k-1}
-
-        P_{k,0} &= P_{k|k-1}
-
-    It inherits from the ExtendedKalmanUpdater as it uses the same linearisation of the sensor
-    function via the :meth:`_measurement_matrix()` function.
-    """
-
-    tolerance: float = Property(
-        default=1e-6,
-        doc="The value of the difference in the measure used as a stopping criterion.")
-    measure: Measure = Property(
-        default=Euclidean(),
-        doc="The measure to use to test the iteration stopping criterion. Defaults to the "
-            "Euclidean distance between current and prior posterior state estimate.")
-    max_iterations: int = Property(
-        default=1000,
-        doc="Number of iterations before while loop is exited and a non-convergence warning is "
-            "returned")
-
-    def update(self, hypothesis, **kwargs):
-        r"""The iterated Kalman update method. Given a hypothesised association between a predicted
-        state or predicted measurement and an actual measurement,
-        calculate the posterior state.
-
-        Parameters
-        ----------
-        hypothesis : :class:`~.SingleHypothesis`
-            the prediction-measurement association hypothesis. This hypothesis
-            may carry a predicted measurement, or a predicted state. In the
-            latter case a predicted measurement will be calculated.
-        **kwargs : various
-            These are passed to the measurement model function
-
-        Returns
-        -------
-        : :class:`~.GaussianStateUpdate`
-            The posterior state Gaussian with mean :math:`\mathbf{x}_{k|k}` and
-            covariance :math:`P_{k|k}`
-
-        """
-
-        # Record the starting point
-        prev_state = hypothesis.prediction
-
-        # Get the measurement model
-        measurement_model = self._check_measurement_model(hypothesis.measurement.measurement_model)
-
-        # The first iteration is just the application of the EKF
-        post_state = super().update(hypothesis, **kwargs)
-
-        # Now update the measurement prediction mean and loop
-        iterations = 0
-        while self.measure(prev_state, post_state) > self.tolerance:
-
-            if iterations > self.max_iterations:
-                warnings.warn("Iterated Kalman update did not converge")
-                break
-
-            # These lines effectively bypass the predict_measurement function in update()
-            # by attaching new linearised quantities to the measurement_prediction. Those
-            # would otherwise be calculated (from the original prediction) by the update() method.
-            hh = self._measurement_matrix(post_state, measurement_model=measurement_model)
-
-            post_state.hypothesis.measurement_prediction.state_vector = \
-                measurement_model.function(post_state, noise=None) + \
-                hh@(hypothesis.prediction.state_vector - post_state.state_vector)
-
-            cross_cov = self._measurement_cross_covariance(hypothesis.prediction, hh)
-            post_state.hypothesis.measurement_prediction.cross_covar = cross_cov
-            post_state.hypothesis.measurement_prediction.covar = \
-                self._innovation_covariance(cross_cov, hh, measurement_model)
-
-            prev_state = post_state
-            post_state = super().update(post_state.hypothesis, **kwargs)
-
-            # increment counter
-            iterations += 1
-
-        return post_state
