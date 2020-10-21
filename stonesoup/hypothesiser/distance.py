@@ -3,7 +3,7 @@ from .base import Hypothesiser
 from ..base import Property
 from ..measures import Measure
 from ..predictor import Predictor
-from ..types.detection import MissedDetection
+from ..types.detection import MissedDetection, GaussianMixtureDetection
 from ..types.hypothesis import SingleDistanceHypothesis
 from ..types.multihypothesis import MultipleHypothesis
 from ..updater import Updater
@@ -17,16 +17,24 @@ class DistanceHypothesiser(Hypothesiser):
     :class:`Measure` class.
     """
 
-    predictor: Predictor = Property(doc="Predict tracks to detection times")
-    updater: Updater = Property(doc="Updater used to get measurement prediction")
-    measure: Measure = Property(
+    predictor = Property(
+        Predictor,
+        doc="Predict tracks to detection times")
+    updater = Property(
+        Updater,
+        doc="Updater used to get measurement prediction")
+    measure = Property(
+        Measure,
         doc="Measure class used to calculate the distance between two states.")
-    missed_distance: float = Property(
+    missed_distance = Property(
+        float,
         default=float('inf'),
         doc="Distance for a missed detection. Default is set to infinity")
-    include_all: bool = Property(
+    include_all = Property(
+        bool,
         default=False,
-        doc="If `True`, hypotheses beyond missed distance will be returned. Default `False`")
+        doc="If `True`, hypotheses beyond missed distance will be returned. "
+            "Default `False`")
 
     def hypothesise(self, track, detections, timestamp):
         """ Evaluate and return all track association hypotheses.
@@ -73,18 +81,40 @@ class DistanceHypothesiser(Hypothesiser):
             prediction = self.predictor.predict(
                 track, timestamp=detection.timestamp)
 
-            # Compute measurement prediction and distance measure
-            measurement_prediction = self.updater.predict_measurement(
-                prediction, detection.measurement_model)
-            distance = self.measure(measurement_prediction, detection)
-
-            if self.include_all or distance < self.missed_distance:
-                # True detection hypothesis
-                hypotheses.append(
-                    SingleDistanceHypothesis(
-                        prediction,
-                        detection,
-                        distance,
-                        measurement_prediction))
+            if isinstance(detection, GaussianMixtureDetection):
+                # Compute measurement prediction and distance measure for
+                # Soft measurements (PHD-EF filter)
+                for sub_detection in detection.components:
+                    soft_measurement_prediction = \
+                        self.updater.soft_predict_measurement(
+                            prediction,
+                            sub_detection,
+                            detection.measurement_model)
+                    distance = self.measure(soft_measurement_prediction, sub_detection)
+                    if self.include_all or distance < self.missed_distance:
+                        # True detection hypothesis
+                        hypotheses.append(
+                            SingleDistanceHypothesis(
+                                prediction,
+                                GaussianMixtureDetection(
+                                        [sub_detection],
+                                        timestamp=detection.timestamp,
+                                        measurement_model=detection.measurement_model,
+                                        metadata=detection.metadata),
+                                distance,
+                                soft_measurement_prediction))
+            else:
+                # Compute measurement prediction and distance measure
+                measurement_prediction = self.updater.predict_measurement(
+                        prediction, detection.measurement_model)
+                distance = self.measure(measurement_prediction, detection)
+                if self.include_all or distance < self.missed_distance:
+                    # True detection hypothesis
+                    hypotheses.append(
+                        SingleDistanceHypothesis(
+                            prediction,
+                            detection,
+                            distance,
+                            measurement_prediction))
 
         return MultipleHypothesis(sorted(hypotheses, reverse=True))
